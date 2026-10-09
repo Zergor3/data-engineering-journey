@@ -1,6 +1,6 @@
 # Olist: modelo dimensional de e-commerce
 
-Proyecto de ingeniería de datos construido sobre el **Brazilian E-Commerce Public Dataset by Olist**. Los CSV se cargan primero tal como llegan a `staging`; después, estos scripts construyen un data warehouse analítico en el esquema `dw`. Todo el flujo está orquestado con **Apache Airflow** sobre Docker.
+Proyecto de ingeniería de datos construido sobre el **Brazilian E-Commerce Public Dataset by Olist**. Los CSV se cargan primero tal como llegan a `staging`; después, estos scripts construyen un data warehouse analítico en el esquema `dw`. El flujo está orquestado con **Apache Airflow** sobre Docker, y el modelo dimensional también está implementado con **dbt** (modelos, tests y linaje).
 
 ## Contexto
 
@@ -104,6 +104,50 @@ Para comprobar que la validación detiene el pipeline, borra una fila de `dw.fac
 
 El DAG `weather_pipeline` (`extract_weather` → `transform_load_weather`) consume la API de Open-Meteo para Lima, guarda el JSON crudo y lo carga a `staging.weather_hourly` con linaje (`_source_file`, `_loaded_at`). `staging` conserva cada carga, y la vista `dw.weather_hourly_latest` deja la más reciente por hora con `ROW_NUMBER()`.
 
+## Transformaciones con dbt
+
+El mismo modelo dimensional está reimplementado con **dbt Core 1.12** y `dbt-postgres` en `dbt/olist_dw/`. dbt construye en el esquema `dbt_dev`, al lado del `dw` hecho con scripts, para poder reconciliar ambos sin riesgo. Las tablas de `staging` entran como *sources* y los modelos se encadenan con `ref()`, de modo que dbt deduce el orden de ejecución.
+
+| Modelo | Filas | Notas |
+|---|---:|---|
+| `dim_date` | 1.461 | Generada con `generate_series`, sin depender de staging |
+| `dim_seller` | 3.095 | |
+| `dim_product` | 32.951 | Traducción de categorías, `unknown` y dos mapeos manuales |
+| `dim_customer` | 96.096 | Una fila por persona; ubicación del pedido más reciente (SCD tipo 1) |
+| `fact_order_items` | 112.650 | Grano `(order_id, order_item_id)`; cinco fechas *role-playing*; suma de `price` = 13.591.643,70 |
+| `fact_payments` | 103.886 | Grano `(order_id, payment_sequential)`; suma de `payment_value` = 16.008.872,12 |
+
+Ambas facts coinciden con staging en número de filas y en suma de la medida.
+
+**Tests (36):** `unique` y `not_null` en claves; `relationships` entre las facts y las dimensiones; y tests singulares: ninguna categoría real sin traducir y grano único en ambas facts. Un macro propio (`date_key`) convierte las fechas a `YYYYMMDD` y evita repetir la expresión.
+
+**Reconciliación:** contra el `dw` hecho con scripts, la comparación de contenido con `EXCEPT` en ambos sentidos (sin incluir las claves sustitutas, que difieren) devolvió 0 filas para `dim_customer` (incluidas las 122 personas con varias ciudades), `dim_seller`, `dim_product` y `fact_order_items`. `dim_date` y `fact_payments` coinciden en número de filas, y `fact_payments` también en la suma de `payment_value`.
+
+```powershell
+cd dbt/olist_dw
+$env:DBT_PROFILES_DIR = "."
+dbt build                      # modelos + tests, en orden de dependencias
+dbt docs generate
+dbt docs serve --port 8081     # documentación y grafo de linaje
+```
+
+![Linaje de los modelos en dbt](docs/dbt_lineage.png)
+
+### dbt dentro de Airflow
+
+El DAG `olist_dbt_pipeline` ejecuta la carga a staging y después `dbt build`:
+
+```mermaid
+flowchart LR
+    A[load_staging] --> B[dbt_build]
+```
+
+- dbt está instalado en un **entorno virtual propio** dentro de la imagen de Airflow (`/opt/airflow/dbt_venv`), con las versiones fijadas, para que sus dependencias no choquen con las de Airflow.
+- La conexión usa `DBT_HOST=db` (el servicio del warehouse en la red de Docker); `profiles.yml` lee esa variable.
+- `--target-path` y `--log-path` apuntan a `/tmp`, para no escribir artefactos en la carpeta montada desde el host.
+- `dbt_build` tiene `retries=0`: dbt termina con código distinto de cero si falla un modelo o un test, y la tarea queda en rojo.
+- Verificado: 6 modelos y 36 tests, `PASS=42 ERROR=0`.
+
 ## Ejecución manual (sin Airflow)
 
 Con los CSV de Olist en `data/olist/`:
@@ -176,13 +220,15 @@ Hallazgos principales:
 - La puntualidad compara días (`YYYYMMDD`), no horas; un pedido entregado el mismo día de la estimación no se considera tardío.
 - `fact_payments` ya está modelada como fact separada. Una `fact_reviews` queda como trabajo futuro, con su propio grano para evitar fan-out.
 - En el pipeline del clima, los archivos crudos se nombran con la hora de ejecución y no con la fecha lógica del DAG, por lo que dos ejecuciones generan dos archivos. La vista `weather_hourly_latest` lo compensa; lo ideal es nombrarlos con `{{ ds }}`.
-- Siguiente ciclo: migrar las transformaciones y validaciones a **dbt** (modelos, tests `unique` / `not_null` / `relationships` y documentación), y ejecutar `dbt build` desde Airflow.
+- Las claves sustitutas de dbt se generan con `ROW_NUMBER()`, por lo que pueden cambiar si llegan filas nuevas; en producción convendría una clave estable derivada del id de negocio (por ejemplo, un hash).
+- dbt construye en `dbt_dev` y el `dw` sigue construyéndose con scripts: ambos conviven para poder reconciliarlos. Siguiente ciclo: un perfil `prod` que apunte a `dw`, retirar el flujo con scripts SQL y añadir una `fact_reviews` con su propio grano.
 
 ## Estructura
 
 ```text
 dags/
   olist_pipeline.py             # DAG: staging -> dw -> validaciones
+  olist_dbt_pipeline.py         # DAG: staging -> dbt build
   weather_pipeline.py           # DAG: API de clima -> staging
 sql/
   01_dw_ddl.sql                 # esquema, dimensiones y hechos
@@ -197,8 +243,14 @@ src/
   transform_load_weather.py     # JSON -> pandas -> staging
 docs/
   data-model.md                 # referencia del modelo y sus granos
+dbt/olist_dw/
+  models/                       # sources.yml, dimensiones, facts y schema.yml (tests)
+  macros/                       # date_key: fecha -> YYYYMMDD
+  tests/                        # tests singulares (categorías, grano)
+  dbt_project.yml
+  profiles.yml                  # conexión de desarrollo (esquema dbt_dev)
 docker-compose.yml              # warehouse + Airflow
-Dockerfile                      # imagen de Airflow con dependencias extra
+Dockerfile                      # imagen de Airflow con pandas y dbt (venv aparte)
 requirements.txt                # dependencias locales
 requirements-airflow.txt        # dependencias dentro de Airflow
 ```
