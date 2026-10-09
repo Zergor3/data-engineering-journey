@@ -23,6 +23,7 @@ x-airflow-common:
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
     # Tu warehouse: dentro de la red de Docker el host es "db", no "localhost"
     DB_URL: postgresql+psycopg2://de:de@db:5432/warehouse
+    DBT_HOST: db
     OLIST_DIR: /opt/airflow/data/olist
     PYTHONPATH: /opt/airflow/src
     RAW_DIR: /opt/airflow/data/raw
@@ -34,6 +35,7 @@ x-airflow-common:
     - ./src:/opt/airflow/src
     - ./sql:/opt/airflow/sql
     - ./data:/opt/airflow/data
+    - ./dbt:/opt/airflow/dbt
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on

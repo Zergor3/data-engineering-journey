@@ -5,3 +5,8 @@ config/
 plugins/
 __pycache__/
 *.pyc
+dbt/olist_dw/target/
+dbt/olist_dw/logs/
+dbt/olist_dw/dbt_packages/
+
+dbt/olist_dw/.user.yml

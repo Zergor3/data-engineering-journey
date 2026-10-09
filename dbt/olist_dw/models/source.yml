@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: staging
+    schema: staging
+    tables:
+      - name: olist_sellers
+      - name: olist_products
+      - name: olist_customers
+      - name: olist_orders
+      - name: olist_order_items
+      - name: olist_order_payments
+      - name: olist_product_category_name_translation

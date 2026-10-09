@@ -1,0 +1,12 @@
+olist_dw:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('DBT_HOST', 'localhost') }}"
+      port: 5432
+      user: de
+      password: de
+      dbname: warehouse
+      schema: dbt_dev
+      threads: 4
