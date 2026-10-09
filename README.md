@@ -1,6 +1,6 @@
 # Olist: modelo dimensional de e-commerce
 
-Proyecto de ingeniería de datos construido sobre el **Brazilian E-Commerce Public Dataset by Olist**. Los CSV se cargan primero tal como llegan a `staging`; después, estos scripts construyen un data warehouse analítico en el esquema `dw`.
+Proyecto de ingeniería de datos construido sobre el **Brazilian E-Commerce Public Dataset by Olist**. Los CSV se cargan primero tal como llegan a `staging`; después, estos scripts construyen un data warehouse analítico en el esquema `dw`. Todo el flujo está orquestado con **Apache Airflow** sobre Docker.
 
 ## Contexto
 
@@ -48,19 +48,70 @@ flowchart LR
 ## Requisitos previos
 
 - Windows con PowerShell 7+ o Linux/macOS con una terminal compatible.
-- Python 3.10+ y Docker Desktop (o Docker Engine + Compose).
+- Python 3.10+ y Docker Desktop (o Docker Engine + Compose), con al menos 4 GB de RAM asignados a Docker.
 - El [dataset Brazilian E-Commerce Public Dataset by Olist](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce), descargado y descomprimido en `data/olist/`.
 
 El dataset se publica bajo licencia **CC BY-NC-SA 4.0**. Consulta los términos y la atribución en su página de Kaggle antes de reutilizarlo fuera de un contexto de aprendizaje.
 
-## Cómo ejecutarlo
+## Orquestación con Airflow
+
+El pipeline completo se ejecuta como un DAG de Airflow (`LocalExecutor`, Airflow 3). Un único `docker-compose.yml` levanta el warehouse (`db`), la base de metadatos de Airflow (`postgres`, separada del warehouse) y los servicios `airflow-apiserver`, `airflow-scheduler` y `airflow-dag-processor`.
+
+```mermaid
+flowchart LR
+    A[load_staging] --> B[create_dw_schema] --> C[load_dw] --> D[validate]
+```
+
+| Tarea | Qué hace |
+|---|---|
+| `load_staging` | Carga los 9 CSV a `staging` (`src/load_olist.py`) |
+| `create_dw_schema` | Ejecuta `sql/01_dw_ddl.sql` (puede repetirse sin error) |
+| `load_dw` | Ejecuta `sql/02_dw_load.sql` (`TRUNCATE` + `INSERT`, idempotente) |
+| `validate` | Ejecuta `sql/03_validations.sql`; falla si el grano o la reconciliación no cuadran |
+
+Decisiones:
+
+- **`schedule=None`:** Olist es un dataset estático, así que el DAG se lanza manualmente.
+- **`validate` con `retries=0`:** si los datos no cuadran, reintentar no los arregla. Las demás tareas reintentan 2 veces.
+- **Una transacción por archivo SQL:** `src/run_sql.py` ejecuta cada script con `psycopg2` en una sola transacción; un fallo hace rollback y no deja el DW a medias. Equivale a `psql -v ON_ERROR_STOP=1`, que no está disponible dentro del contenedor.
+- **Configuración fuera del código:** la conexión (`DB_URL`) y las rutas se leen de variables de entorno definidas en el compose, por lo que los mismos scripts funcionan en local y en Airflow.
+
+Cómo levantarlo:
+
+```powershell
+mkdir dags, logs, config, plugins
+
+$key = python -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
+@"
+AIRFLOW_UID=50000
+FERNET_KEY=$key
+"@ | Set-Content .env
+
+docker compose build
+docker compose up airflow-init
+docker compose up -d
+```
+
+Abre `http://localhost:8080` (usuario y contraseña de desarrollo: `airflow` / `airflow`), activa `olist_pipeline` y lánzalo con **Trigger**.
+
+![Vista Graph del DAG olist_pipeline](docs/airflow_olist_graph.png)
+
+Para comprobar que la validación detiene el pipeline, borra una fila de `dw.fact_payments`, limpia la tarea `validate` y verás que falla; al limpiar `load_dw` con *downstream*, el DW se reconstruye y `validate` pasa.
+
+> No uses `docker compose down -v`: el `-v` borra los volúmenes, incluido el del warehouse.
+
+### Pipeline del clima
+
+El DAG `weather_pipeline` (`extract_weather` → `transform_load_weather`) consume la API de Open-Meteo para Lima, guarda el JSON crudo y lo carga a `staging.weather_hourly` con linaje (`_source_file`, `_loaded_at`). `staging` conserva cada carga, y la vista `dw.weather_hourly_latest` deja la más reciente por hora con `ROW_NUMBER()`.
+
+## Ejecución manual (sin Airflow)
 
 Con los CSV de Olist en `data/olist/`:
 
 ```powershell
-# 1. Instala dependencias, inicia Postgres y carga los CSV a staging
+# 1. Instala dependencias, inicia el warehouse y carga los CSV a staging
 pip install -r requirements.txt
-docker compose up -d
+docker compose up -d db
 python src/load_olist.py
 
 # 2. Construye el warehouse y valida
@@ -72,7 +123,7 @@ Get-Content -Raw sql/03_validations.sql | docker compose exec -T db psql -v ON_E
 Get-Content -Raw sql/04_business_queries.sql | docker compose exec -T db psql -U de -d warehouse
 ```
 
-Los comandos anteriores son para **Windows/PowerShell** y envían el contenido de los archivos al contenedor, así que no hace falta montar el proyecto como volumen. En Linux/macOS usa, para cada script:
+Los comandos anteriores son para **Windows/PowerShell**. En Linux/macOS usa, para cada script:
 
 ```bash
 docker compose exec -T db psql -v ON_ERROR_STOP=1 -U de -d warehouse < sql/01_dw_ddl.sql
@@ -124,19 +175,30 @@ Hallazgos principales:
 - Los extremos del dataset son parciales: 2016 y septiembre de 2018 contienen pocos datos. Por eso el análisis mensual se limita de enero de 2017 a agosto de 2018.
 - La puntualidad compara días (`YYYYMMDD`), no horas; un pedido entregado el mismo día de la estimación no se considera tardío.
 - `fact_payments` ya está modelada como fact separada. Una `fact_reviews` queda como trabajo futuro, con su propio grano para evitar fan-out.
-- Siguiente ciclo: orquestar con Airflow (carga a staging, construcción del DW y validación como tareas dependientes) y migrar transformaciones y validaciones a dbt.
+- En el pipeline del clima, los archivos crudos se nombran con la hora de ejecución y no con la fecha lógica del DAG, por lo que dos ejecuciones generan dos archivos. La vista `weather_hourly_latest` lo compensa; lo ideal es nombrarlos con `{{ ds }}`.
+- Siguiente ciclo: migrar las transformaciones y validaciones a **dbt** (modelos, tests `unique` / `not_null` / `relationships` y documentación), y ejecutar `dbt build` desde Airflow.
 
 ## Estructura
 
 ```text
+dags/
+  olist_pipeline.py             # DAG: staging -> dw -> validaciones
+  weather_pipeline.py           # DAG: API de clima -> staging
 sql/
-  01_dw_ddl.sql             # esquema, dimensiones y hechos
-  02_dw_load.sql            # carga idempotente desde staging (TRUNCATE + INSERT)
-  03_validations.sql        # controles pasa/falla y reconciliaciones
-  04_business_queries.sql   # consultas de negocio
-  exploration.sql           # detalle para inspección manual
-docs/
-  data-model.md             # referencia del modelo y sus granos
+  01_dw_ddl.sql                 # esquema, dimensiones y hechos
+  02_dw_load.sql                # carga idempotente desde staging (TRUNCATE + INSERT)
+  03_validations.sql            # controles pasa/falla y reconciliaciones
+  04_business_queries.sql       # consultas de negocio
+  exploration.sql               # detalle para inspección manual
 src/
-  load_olist.py             # CSV -> staging
+  load_olist.py                 # CSV -> staging
+  run_sql.py                    # ejecuta archivos .sql (usado por Airflow)
+  extract_weather.py            # API de clima -> JSON crudo
+  transform_load_weather.py     # JSON -> pandas -> staging
+docs/
+  data-model.md                 # referencia del modelo y sus granos
+docker-compose.yml              # warehouse + Airflow
+Dockerfile                      # imagen de Airflow con dependencias extra
+requirements.txt                # dependencias locales
+requirements-airflow.txt        # dependencias dentro de Airflow
 ```
