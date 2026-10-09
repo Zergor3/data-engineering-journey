@@ -1,1 +1,7 @@
 data/
+.env
+logs/
+config/
+plugins/
+__pycache__/
+*.pyc

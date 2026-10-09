@@ -1,7 +1,9 @@
 import json
 import logging
+import os
 from pathlib import Path
 
+import os
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -9,8 +11,8 @@ from sqlalchemy.engine import Engine
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-DB_URL = "postgresql+psycopg2://de:de@localhost:5432/warehouse"
-RAW_DIR = Path("data/raw")
+DB_URL = os.getenv("DB_URL", "postgresql+psycopg2://de:de@localhost:5432/warehouse")
+RAW_DIR = Path(os.getenv("RAW_DIR", "data/raw"))
 TABLE = "weather_hourly"
 SCHEMA = "staging"
 
@@ -65,9 +67,13 @@ def load(df: pd.DataFrame, engine: Engine) -> None:
     log.info("Cargadas %d filas en %s.%s", len(df), SCHEMA, TABLE)
 
 
-if __name__ == "__main__":
+def run() -> None:
     path = latest_raw_file()
     log.info("Procesando %s", path)
     df = to_dataframe(path)
     log.info("Shape: %s | nulos:\n%s", df.shape, df.isna().sum())
     load(df, create_engine(DB_URL))
+
+
+if __name__ == "__main__":
+    run()

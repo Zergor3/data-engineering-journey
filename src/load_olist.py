@@ -1,14 +1,15 @@
 import logging
 from pathlib import Path
 
+import os
 import pandas as pd
 from sqlalchemy import create_engine, text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-DB_URL = "postgresql+psycopg2://de:de@localhost:5432/warehouse"
-SRC_DIR = Path("data/olist")
+DB_URL = os.getenv("DB_URL", "postgresql+psycopg2://de:de@localhost:5432/warehouse")
+SRC_DIR = Path(os.getenv("OLIST_DIR", "data/olist"))
 SCHEMA = "staging"
 PREFIX = "olist_"          # tablas: staging.olist_orders, staging.olist_customers, ...
 CHUNK = 50_000
@@ -37,7 +38,7 @@ def load_csv(path: Path, engine) -> int:
     return total
 
 
-if __name__ == "__main__":
+def run() -> None:
     engine = create_engine(DB_URL)
     with engine.begin() as conn:
         conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"))
@@ -47,3 +48,7 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"No hay CSV en {SRC_DIR}")
     for f in files:
         load_csv(f, engine)
+
+
+if __name__ == "__main__":
+    run()

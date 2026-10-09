@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+import os
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -18,7 +19,7 @@ PARAMS = {
     "past_days": 7,
     "timezone": "America/Lima",
 }
-RAW_DIR = Path("data/raw")
+RAW_DIR = Path(os.getenv("RAW_DIR", "data/raw"))
 
 
 def build_session() -> requests.Session:
